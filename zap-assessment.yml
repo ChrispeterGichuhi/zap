@@ -1,0 +1,208 @@
+name: ZAP Security Assessment
+
+# Manual trigger only: Actions tab -> "ZAP Security Assessment" -> Run workflow
+on:
+  workflow_dispatch:
+    inputs:
+      target_mode:
+        description: "url = scan the public URL below | juice-shop = scan a deliberately vulnerable lab app started inside this runner (no permission issues)"
+        type: choice
+        options: [url, juice-shop]
+        default: url
+      target:
+        description: "Target URL (used only when target_mode = url)"
+        type: string
+        default: "http://www.itsecgames.com"
+      authorized:
+        description: "I have permission to test this target (see TARGET_AUTHORIZATION.md)"
+        type: choice
+        options: ["no", "yes"]
+        default: "no"
+      scan_type:
+        description: "full = spider + AJAX spider + active scan | baseline = spider + passive only"
+        type: choice
+        options: [full, baseline]
+        default: full
+      desktop_screenshots:
+        description: "Also launch the ZAP desktop GUI under Xvfb and screenshot it (Part 1 / 3.1 / 3.2). Experimental."
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+env:
+  ZAP_IMAGE: ghcr.io/zaproxy/zaproxy:stable
+  ZAP_DESKTOP_VERSION: "2.17.0"
+
+jobs:
+  assess:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      # ------------------------------------------------------------------
+      # Part 2: target selection + permission guard
+      # ------------------------------------------------------------------
+      - name: "Part 2 - Resolve and record target"
+        env:
+          MODE: ${{ inputs.target_mode }}
+          URL_INPUT: ${{ inputs.target }}
+          AUTH: ${{ inputs.authorized }}
+        run: |
+          mkdir -p evidence zap-out
+          chmod 777 zap-out
+          if [ "$MODE" = "juice-shop" ]; then
+            TARGET="http://localhost:3000"
+            BASIS="Self-hosted OWASP Juice Shop container started inside the CI runner (intentionally vulnerable training app; no third party involved)."
+          else
+            TARGET="$URL_INPUT"
+            BASIS="Public URL. Authorization confirmed by the student: $AUTH. See TARGET_AUTHORIZATION.md."
+            if [ "$AUTH" != "yes" ]; then
+              echo "::error::Set 'authorized' to yes only if you have permission to test $TARGET (assignment rule: ethical hacking only)."
+              exit 1
+            fi
+          fi
+          echo "TARGET=$TARGET" >> "$GITHUB_ENV"
+          {
+            echo "# Part 2 - Target documentation"
+            echo
+            echo "- **Target URL:** $TARGET"
+            echo "- **Mode:** $MODE"
+            echo "- **Basis for testing:** $BASIS"
+            echo "- **Date (UTC):** $(date -u +'%Y-%m-%d %H:%M:%S')"
+            echo "- **Triggered by:** $GITHUB_ACTOR  |  **Run:** $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          } | tee evidence/00-target.md
+
+      - name: Start lab target (juice-shop mode only)
+        if: ${{ inputs.target_mode == 'juice-shop' }}
+        run: |
+          docker run -d --name lab -p 3000:3000 bkimminich/juice-shop
+          for i in $(seq 1 60); do
+            curl -fs http://localhost:3000 >/dev/null && echo "lab is up" && exit 0
+            sleep 2
+          done
+          echo "::error::lab target did not start"; docker logs lab; exit 1
+
+      # ------------------------------------------------------------------
+      # Part 1 + 3.1 + 3.2: install / launch / configure evidence
+      # ------------------------------------------------------------------
+      - name: "Part 1 / 3.1 - Install and launch ZAP (version evidence)"
+        run: |
+          {
+            echo "=== Runner ==="; uname -a; lsb_release -d 2>/dev/null || true
+            echo; echo "=== Pull official ZAP image (Part 1.1: install from official source) ==="
+            docker pull "$ZAP_IMAGE"
+            echo; echo "=== Image digest ==="; docker image inspect "$ZAP_IMAGE" --format '{{index .RepoDigests 0}}'
+            echo; echo "=== Launch ZAP and print version (Part 3.1) ==="
+            docker run --rm "$ZAP_IMAGE" zap.sh -version
+            echo; echo "=== ZAP command-line options (Part 1.2: familiarise with functionality) ==="
+            docker run --rm "$ZAP_IMAGE" zap-full-scan.py -h 2>&1 | head -60 || true
+          } 2>&1 | tee evidence/01-zap-setup.log
+
+      - name: "Part 3.2 - Configure ZAP for the target (config is the evidence)"
+        env:
+          SCAN_TYPE: ${{ inputs.scan_type }}
+        run: |
+          if [ "$SCAN_TYPE" = "full" ]; then
+            echo 'SCRIPT=zap-full-scan.py'   >> "$GITHUB_ENV"
+            echo 'EXTRA=-a -j -m 5 -T 60'    >> "$GITHUB_ENV"
+          else
+            echo 'SCRIPT=zap-baseline.py'    >> "$GITHUB_ENV"
+            echo 'EXTRA=-a -j -m 3'          >> "$GITHUB_ENV"
+          fi
+          {
+            echo "# Part 3.2 - ZAP configuration"
+            echo "Target        : $TARGET"
+            echo "Scan script   : $( [ "$SCAN_TYPE" = full ] && echo zap-full-scan.py || echo zap-baseline.py )"
+            echo "Options       : $( [ "$SCAN_TYPE" = full ] && echo '-a -j -m 5 -T 60' || echo '-a -j -m 3' )"
+            echo "  -a  include alpha-status rules"
+            echo "  -j  use the AJAX spider (modern JavaScript apps) in addition to the traditional spider"
+            echo "  -m  max minutes for the spider"
+            echo "  -T  max minutes for the whole scan (full scan only)"
+            echo "Reports       : HTML, JSON, Markdown, XML"
+          } | tee evidence/02-zap-config.txt
+
+      # ------------------------------------------------------------------
+      # Part 3.3: automated scan
+      # ------------------------------------------------------------------
+      - name: "Part 3.3 - Automated ZAP scan"
+        run: |
+          set +e
+          docker run --rm --network host -v "$PWD/zap-out:/zap/wrk:rw" "$ZAP_IMAGE" \
+            $SCRIPT -t "$TARGET" $EXTRA \
+            -r report_html.html -J report_json.json -w report_md.md -x report_xml.xml \
+            2>&1 | tee evidence/03-zap-scan-console.log
+          echo "ZAP exit code: ${PIPESTATUS[0]} (0=clean, 1=failures, 2=warnings, 3=error)" | tee -a evidence/03-zap-scan-console.log
+          set -e
+          ls -la zap-out
+          test -s zap-out/report_json.json   # fail the job if ZAP produced no report
+
+      # ------------------------------------------------------------------
+      # Part 3.4: manual assessment (scripted, non-intrusive)
+      # ------------------------------------------------------------------
+      - name: "Part 3.4 - Manual security checks"
+        run: python3 scripts/manual_checks.py "$TARGET" evidence
+
+      - name: Install Playwright
+        run: |
+          python3 -m pip install --quiet playwright matplotlib
+          python3 -m playwright install --with-deps chromium
+
+      - name: "Part 3.4 / 3.5 - Screenshots (site, clickjacking test, headers, ZAP report)"
+        run: python3 scripts/screenshots.py "$TARGET" evidence zap-out/report_html.html
+
+      # ------------------------------------------------------------------
+      # Part 3.5 / 4: findings tables
+      # ------------------------------------------------------------------
+      - name: "Part 3.5 / 4 - Build findings summary"
+        run: python3 scripts/build_evidence.py zap-out/report_json.json evidence "$GITHUB_STEP_SUMMARY"
+
+      # ------------------------------------------------------------------
+      # Optional: ZAP desktop GUI evidence (Part 1 / 3.1 / 3.2) - experimental
+      # ------------------------------------------------------------------
+      - name: "[optional] Install GUI dependencies"
+        if: ${{ inputs.desktop_screenshots }}
+        continue-on-error: true
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq xvfb xdotool imagemagick
+          curl -fsSL -o zap.tgz "https://github.com/zaproxy/zaproxy/releases/download/v${ZAP_DESKTOP_VERSION}/ZAP_${ZAP_DESKTOP_VERSION}_Linux.tar.gz"
+          mkdir -p "$RUNNER_TEMP/zapdesk" && tar -xzf zap.tgz -C "$RUNNER_TEMP/zapdesk" --strip-components=1
+          ls "$RUNNER_TEMP/zapdesk" | tee evidence/04-zap-desktop-install-listing.txt
+
+      - name: "[optional] Launch ZAP desktop and screenshot it"
+        if: ${{ inputs.desktop_screenshots }}
+        continue-on-error: true
+        run: |
+          mkdir -p evidence/screenshots
+          Xvfb :99 -screen 0 1600x900x24 &
+          sleep 3
+          export DISPLAY=:99
+          "$RUNNER_TEMP/zapdesk/zap.sh" -silent -newsession "$RUNNER_TEMP/gui.session" -config api.disablekey=true > evidence/04-zap-desktop.log 2>&1 &
+          for i in $(seq 1 90); do
+            curl -fs http://127.0.0.1:8080/JSON/core/view/version/ >/dev/null && break
+            sleep 2
+          done
+          sleep 15
+          xdotool key Escape; sleep 1; xdotool key Escape; sleep 2
+          import -window root evidence/screenshots/10-zap-desktop-main-window.png
+          # point ZAP at the target (appears in the Sites tree) and spider it
+          curl -fs "http://127.0.0.1:8080/JSON/core/action/accessUrl/?url=$TARGET" >/dev/null || true
+          curl -fs "http://127.0.0.1:8080/JSON/spider/action/scan/?url=$TARGET&maxChildren=20" >/dev/null || true
+          sleep 60
+          import -window root evidence/screenshots/11-zap-desktop-target-sites-tree.png
+
+      # ------------------------------------------------------------------
+      # Publish everything
+      # ------------------------------------------------------------------
+      - name: Upload evidence bundle
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: zap-evidence
+          path: |
+            evidence/
+            zap-out/
+          retention-days: 30
